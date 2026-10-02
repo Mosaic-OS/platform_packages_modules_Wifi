@@ -98,6 +98,7 @@ import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.notNull;
 import static org.mockito.ArgumentMatchers.nullable;
+import static org.mockito.Mockito.RETURNS_SELF;
 import static org.mockito.Mockito.anyBoolean;
 import static org.mockito.Mockito.anyInt;
 import static org.mockito.Mockito.argThat;
@@ -125,6 +126,8 @@ import static org.mockito.Mockito.withSettings;
 import android.Manifest;
 import android.app.ActivityManager;
 import android.app.AppOpsManager;
+import android.app.KeyguardManager;
+import android.app.Notification;
 import android.app.admin.DevicePolicyManager;
 import android.app.admin.WifiSsidPolicy;
 import android.app.compat.CompatChanges;
@@ -1866,7 +1869,7 @@ public class WifiServiceImplTest extends WifiBaseTest {
 
         assertTrue(mWifiServiceImpl.setSoftApConfiguration(apConfig, TEST_PACKAGE_NAME));
         verify(mWifiApConfigStore).setApConfiguration(eq(apConfig));
-        verify(mActiveModeWarden).updateSoftApConfiguration(apConfig);
+        verify(mActiveModeWarden).updateSoftApConfiguration(apConfig, Binder.getCallingUid());
         verify(mWifiPermissionsUtil).checkNetworkSettingsPermission(anyInt());
     }
 
@@ -1880,7 +1883,7 @@ public class WifiServiceImplTest extends WifiBaseTest {
 
         assertTrue(mWifiServiceImpl.setSoftApConfiguration(apConfig, TEST_PACKAGE_NAME));
         verify(mWifiApConfigStore).setApConfiguration(eq(apConfig));
-        verify(mActiveModeWarden).updateSoftApConfiguration(apConfig);
+        verify(mActiveModeWarden).updateSoftApConfiguration(apConfig, Binder.getCallingUid());
         verify(mWifiPermissionsUtil).checkConfigOverridePermission(anyInt());
     }
 
@@ -1892,7 +1895,7 @@ public class WifiServiceImplTest extends WifiBaseTest {
         when(mWifiPermissionsUtil.checkConfigOverridePermission(anyInt())).thenReturn(true);
         assertFalse(mWifiServiceImpl.setSoftApConfiguration(null, TEST_PACKAGE_NAME));
         verify(mWifiApConfigStore, never()).setApConfiguration(isNull());
-        verify(mActiveModeWarden, never()).updateSoftApConfiguration(any());
+        verify(mActiveModeWarden, never()).updateSoftApConfiguration(any(), anyInt());
         verify(mWifiPermissionsUtil).checkConfigOverridePermission(anyInt());
     }
 
@@ -14154,6 +14157,90 @@ public class WifiServiceImplTest extends WifiBaseTest {
         mWifiServiceImpl.getSupportedInterfaceNames(listener);
         mLooper.dispatchAll();
         inOrder.verify(listener).onResult(List.of("wlan0"));
+    }
+
+    private void prepareSoftApUserSwitchNotificationTest() {
+        assumeTrue(Environment.isSdkAtLeastC());
+        when(mFeatureFlags.multiUserWifiEnhancement()).thenReturn(true);
+        when(mUserManager.isUserUnlocked(any(UserHandle.class))).thenReturn(true);
+        KeyguardManager keyguard = mock(KeyguardManager.class);
+        when(mContext.getSystemService(KeyguardManager.class)).thenReturn(keyguard);
+        when(keyguard.isKeyguardLocked()).thenReturn(false);
+        Notification.Builder builder = mock(Notification.Builder.class, RETURNS_SELF);
+        when(builder.build()).thenReturn(mock(Notification.class));
+        when(mFrameworkFacade.makeNotificationBuilder(any(), anyString())).thenReturn(builder);
+        when(mContext.getWifiOverlayApkPkgName()).thenReturn("com.android.wifi.resources");
+        SoftApManager manager = mock(SoftApManager.class);
+        when(manager.isStarted()).thenReturn(true);
+        when(mActiveModeWarden.getTetheredSoftApManager()).thenReturn(manager);
+        mStateMachineSoftApCallback.onStateChanged(new SoftApState(
+                WIFI_AP_STATE_ENABLED, 0, TEST_TETHERING_REQUEST, TEST_IFACE_NAME));
+    }
+
+    @Test
+    public void testPreservedSoftApDoesNotPostUserSwitchNotification() throws Exception {
+        prepareSoftApUserSwitchNotificationTest();
+        mWifiServiceImpl.handleUserSwitch(10);
+        mLooper.dispatchAll();
+        mStateMachineSoftApCallback.onUserSwitchWithSoftAp(true);
+        mStateMachineSoftApCallback.onStateChanged(new SoftApState(
+                WIFI_AP_STATE_DISABLED, 0, TEST_TETHERING_REQUEST, TEST_IFACE_NAME));
+        verify(mWifiNotificationManager, never()).notify(
+                eq(SoftApNotifier.NOTIFICATION_ID_SOFTAP_AUTO_DISABLED), any());
+    }
+
+    @Test
+    public void testSoftApUserSwitchFallbackNotifiesOnlyAfterStopped() throws Exception {
+        prepareSoftApUserSwitchNotificationTest();
+        mWifiServiceImpl.handleUserSwitch(10);
+        mLooper.dispatchAll();
+        mStateMachineSoftApCallback.onUserSwitchWithSoftAp(true);
+        mStateMachineSoftApCallback.onUserSwitchWithSoftAp(false);
+        mStateMachineSoftApCallback.onStateChanged(new SoftApState(
+                WIFI_AP_STATE_DISABLING, 0, TEST_TETHERING_REQUEST, TEST_IFACE_NAME));
+        verify(mWifiNotificationManager, never()).notify(
+                eq(SoftApNotifier.NOTIFICATION_ID_SOFTAP_AUTO_DISABLED), any());
+        mStateMachineSoftApCallback.onStateChanged(new SoftApState(
+                WIFI_AP_STATE_DISABLED, 0, TEST_TETHERING_REQUEST, TEST_IFACE_NAME));
+        mStateMachineSoftApCallback.onStateChanged(new SoftApState(
+                WIFI_AP_STATE_DISABLED, 0, TEST_TETHERING_REQUEST, TEST_IFACE_NAME));
+        verify(mWifiNotificationManager).notify(
+                eq(SoftApNotifier.NOTIFICATION_ID_SOFTAP_AUTO_DISABLED), any());
+    }
+
+    @Test
+    public void testSoftApUserStopStillPostsNotification() throws Exception {
+        prepareSoftApUserSwitchNotificationTest();
+        mWifiServiceImpl.handleUserStop(0);
+        mLooper.dispatchAll();
+        verify(mWifiNotificationManager, never()).notify(
+                eq(SoftApNotifier.NOTIFICATION_ID_SOFTAP_AUTO_DISABLED), any());
+        mStateMachineSoftApCallback.onStateChanged(new SoftApState(
+                WIFI_AP_STATE_DISABLED, 0, TEST_TETHERING_REQUEST, TEST_IFACE_NAME));
+        verify(mWifiNotificationManager).notify(
+                eq(SoftApNotifier.NOTIFICATION_ID_SOFTAP_AUTO_DISABLED), any());
+    }
+
+    @Test
+    public void testTetheringRerequestAfterUserSwitchCannotReplaceRunningConfig() throws Exception {
+        assumeTrue(Environment.isSdkAtLeastC());
+        when(mFeatureFlags.multiUserWifiEnhancement()).thenReturn(true);
+        SoftApConfiguration config = createValidSoftApConfiguration();
+        assertTrue(mWifiServiceImpl.startTetheredHotspot(config, TEST_PACKAGE_NAME));
+        mStateMachineSoftApCallback.onStateChanged(new SoftApState(
+                WIFI_AP_STATE_ENABLED, 0, TEST_TETHERING_REQUEST, TEST_IFACE_NAME));
+        mWifiServiceImpl.handleUserSwitch(10);
+        mLooper.dispatchAll();
+        mStateMachineSoftApCallback.onUserSwitchWithSoftAp(true);
+        assertFalse(mWifiServiceImpl.startTetheredHotspot(null, TEST_PACKAGE_NAME));
+        assertFalse(mWifiServiceImpl.startSoftAp(null, TEST_PACKAGE_NAME));
+        mWifiServiceImpl.startTetheredHotspotRequest(
+                TEST_TETHERING_REQUEST, mAnotherSoftApCallback, TEST_PACKAGE_NAME);
+        verify(mAnotherSoftApCallback).onStateChanged(argThat(
+                state -> state.getState() == WIFI_AP_STATE_FAILED));
+        verify(mActiveModeWarden).startSoftAp(mSoftApModeConfigCaptor.capture(), any());
+        assertThat(mSoftApModeConfigCaptor.getValue().getSoftApConfiguration()).isEqualTo(config);
+        assertEquals(WIFI_AP_STATE_ENABLED, mWifiServiceImpl.getWifiApEnabledState());
     }
 
     @Test

@@ -97,6 +97,7 @@ import android.os.Handler;
 import android.os.IBinder;
 import android.os.Process;
 import android.os.RemoteException;
+import android.os.UserHandle;
 import android.os.UserManager;
 import android.os.WorkSource;
 import android.os.test.TestLooper;
@@ -3381,7 +3382,7 @@ public class ActiveModeWardenTest extends WifiBaseTest {
         SoftApConfiguration testConfig = new SoftApConfiguration.Builder()
                 .setSsid("Test123").build();
         enterSoftApActiveMode();
-        mActiveModeWarden.updateSoftApConfiguration(testConfig);
+        mActiveModeWarden.updateSoftApConfiguration(testConfig, Process.SYSTEM_UID);
         mLooper.dispatchAll();
         verify(mSoftApManager).updateConfiguration(testConfig);
     }
@@ -3411,7 +3412,7 @@ public class ActiveModeWardenTest extends WifiBaseTest {
         SoftApConfiguration testConfig = new SoftApConfiguration.Builder()
                 .setSsid("Test123").build();
         enterClientModeActiveState();
-        mActiveModeWarden.updateSoftApConfiguration(testConfig);
+        mActiveModeWarden.updateSoftApConfiguration(testConfig, Process.SYSTEM_UID);
         mLooper.dispatchAll();
         verify(mSoftApManager, never()).updateConfiguration(any());
     }
@@ -6086,7 +6087,7 @@ public class ActiveModeWardenTest extends WifiBaseTest {
     }
 
     @Test
-    public void testHandleUserSwitchInEnabledStateStopsSoftAp() throws Exception {
+    public void testHandleUserSwitchStopsSoftApWhenNotStarted() throws Exception {
         // Start in enabled state with SoftAP active
         enterSoftApActiveMode();
         assertNotNull(mActiveModeWarden.getTetheredSoftApManager());
@@ -6096,6 +6097,261 @@ public class ActiveModeWardenTest extends WifiBaseTest {
                     mActiveModeWarden.handleUserSwitch(10);
                     mLooper.dispatchAll();
                 });
+    }
+
+    private void enterStartedTetheredSoftApForUserSwitch() throws Exception {
+        SoftApConfiguration config = new SoftApConfiguration.Builder().setSsid("OwnerAP").build();
+        enterSoftApActiveMode(new SoftApModeConfiguration(IFACE_IP_MODE_TETHERED, config,
+                mSoftApCapability, TEST_COUNTRYCODE, null));
+        when(mSoftApManager.isStarted()).thenReturn(true);
+    }
+
+    @Test
+    public void testUserSwitchKeepsSoftApAndOwnerConfigurationOnReturn() throws Exception {
+        enterStartedTetheredSoftApForUserSwitch();
+        mActiveModeWarden.handleUserSwitch(10);
+        mActiveModeWarden.handleUserUnlock(10);
+        mLooper.dispatchAll();
+        SoftApConfiguration config = new SoftApConfiguration.Builder().setSsid("UpdatedAP").build();
+        mActiveModeWarden.updateSoftApConfiguration(config, Process.SYSTEM_UID);
+        mLooper.dispatchAll();
+        verify(mSoftApManager, never()).updateConfiguration(any());
+        mActiveModeWarden.handleUserSwitch(0);
+        mActiveModeWarden.handleUserUnlock(0);
+        mLooper.dispatchAll();
+        mActiveModeWarden.updateSoftApConfiguration(config, Process.SYSTEM_UID);
+        mLooper.dispatchAll();
+        verify(mSoftApManager).updateConfiguration(config);
+        verify(mSoftApManager, never()).stop();
+        verify(mWifiInjector, never()).makeClientModeManager(any(), any(), any(), anyBoolean());
+        verify(mWifiInjector).makeSoftApManager(any(), any(), any(), any(), any(), anyBoolean());
+        verify(mSoftApStateMachineCallback, times(2)).onUserSwitchWithSoftAp(true);
+        assertEquals(mSoftApManager, mActiveModeWarden.getTetheredSoftApManager());
+        assertInEnabledState();
+    }
+
+    @Test
+    public void testUserSwitchUnlockWaitsForAllClientsAndLocalOnlyHotspot() throws Exception {
+        when(mWifiNative.isItPossibleToCreateStaIface(any())).thenReturn(true);
+        when(mWifiResourceCache.getBoolean(R.bool.config_wifiMultiStaRestrictedConcurrencyEnabled))
+                .thenReturn(true);
+        ConcreteClientModeManager secondary = mock(ConcreteClientModeManager.class);
+        Listener<ConcreteClientModeManager> secondaryListener = requestAdditionalClientModeManager(
+                ROLE_CLIENT_SECONDARY_LONG_LIVED, secondary,
+                mock(ExternalClientModeManagerRequestListener.class), TEST_SSID_2, TEST_BSSID_2);
+        enterStartedTetheredSoftApForUserSwitch();
+        SoftApManager lohs = mock(SoftApManager.class);
+        when(lohs.getRole()).thenReturn(ROLE_SOFTAP_LOCAL_ONLY);
+        SoftApModeConfiguration lohsConfig = new SoftApModeConfiguration(
+                WifiManager.IFACE_IP_MODE_LOCAL_ONLY,
+                new SoftApConfiguration.Builder().setSsid("LocalAP").build(),
+                mSoftApCapability, TEST_COUNTRYCODE, null);
+        when(lohs.getSoftApModeConfiguration()).thenReturn(lohsConfig);
+        ArgumentCaptor<Listener<SoftApManager>> lohsListener =
+                ArgumentCaptor.forClass(Listener.class);
+        when(mWifiInjector.makeSoftApManager(lohsListener.capture(), any(), eq(lohsConfig),
+                any(), eq(ROLE_SOFTAP_LOCAL_ONLY), anyBoolean())).thenReturn(lohs);
+        mActiveModeWarden.startSoftAp(lohsConfig, TEST_WORKSOURCE);
+        mLooper.dispatchAll();
+        lohsListener.getValue().onStarted(lohs);
+        mActiveModeWarden.handleUserSwitch(10);
+        mActiveModeWarden.handleUserUnlock(10);
+        mActiveModeWarden.wifiToggled(TEST_WORKSOURCE);
+        mLooper.dispatchAll();
+        verify(mClientModeManager).stop();
+        verify(secondary).stop();
+        verify(lohs).stop();
+        verify(mSoftApManager, never()).stop();
+        mClientListener.onStopped(mClientModeManager);
+        mLooper.dispatchAll();
+        secondaryListener.onStartFailure(secondary);
+        mLooper.dispatchAll();
+        verify(mWifiInjector, times(2)).makeClientModeManager(any(), any(), any(), anyBoolean());
+        lohsListener.getValue().onStopped(lohs);
+        mLooper.dispatchAll();
+        verify(mWifiInjector).makeClientModeManager(any(), eq(INTERNAL_REQUESTOR_WS),
+                eq(ROLE_CLIENT_PRIMARY), anyBoolean());
+        verify(mWifiInjector, times(3)).makeClientModeManager(any(), any(), any(), anyBoolean());
+        assertInEnabledState();
+    }
+
+    @Test
+    public void testUserSwitchWaitsForLateUnlockWithSoftAp() throws Exception {
+        enterClientModeActiveState();
+        enterStartedTetheredSoftApForUserSwitch();
+        mActiveModeWarden.handleUserSwitch(10);
+        mLooper.dispatchAll();
+        mClientListener.onStopped(mClientModeManager);
+        mLooper.dispatchAll();
+        verify(mWifiInjector).makeClientModeManager(any(), any(), any(), anyBoolean());
+        mActiveModeWarden.handleUserUnlock(10);
+        mLooper.dispatchAll();
+        verify(mWifiInjector, times(2)).makeClientModeManager(any(), any(), any(), anyBoolean());
+        verify(mSoftApManager, never()).stop();
+    }
+
+    @Test
+    public void testUserSwitchAlreadyUnlockedRestartsScanOnlyWithSoftAp() throws Exception {
+        enterScanOnlyModeActiveState();
+        enterStartedTetheredSoftApForUserSwitch();
+        when(mUserManager.isUserUnlockingOrUnlocked(any())).thenReturn(true);
+        mActiveModeWarden.handleUserSwitch(10);
+        mLooper.dispatchAll();
+        verify(mWifiInjector).makeClientModeManager(any(), any(), any(), anyBoolean());
+        mClientListener.onStopped(mClientModeManager);
+        mLooper.dispatchAll();
+        verify(mWifiInjector).makeClientModeManager(any(), eq(INTERNAL_REQUESTOR_WS),
+                eq(ROLE_CLIENT_SCAN_ONLY), anyBoolean());
+        verify(mSoftApManager, never()).stop();
+    }
+
+    @Test
+    public void testUserSwitchNewUserWifiOffKeepsSoftApWithoutSta() throws Exception {
+        enterClientModeActiveState();
+        enterStartedTetheredSoftApForUserSwitch();
+        mActiveModeWarden.handleUserSwitch(10);
+        when(mSettingsStore.isWifiToggleEnabled()).thenReturn(false);
+        mActiveModeWarden.handleUserUnlock(10);
+        mLooper.dispatchAll();
+        mClientListener.onStopped(mClientModeManager);
+        mLooper.dispatchAll();
+        verify(mWifiInjector).makeClientModeManager(any(), any(), any(), anyBoolean());
+        verify(mSoftApManager, never()).stop();
+        assertInEnabledState();
+    }
+
+    @Test
+    public void testUserSwitchSoftApFailureFallsBackAndReleasesUnlock() throws Exception {
+        enterClientModeActiveState();
+        enterStartedTetheredSoftApForUserSwitch();
+        mActiveModeWarden.handleUserSwitch(10);
+        mActiveModeWarden.handleUserUnlock(10);
+        mLooper.dispatchAll();
+        mSoftApListener.onStartFailure(mSoftApManager);
+        mLooper.dispatchAll();
+        verify(mWifiInjector).makeClientModeManager(any(), any(), any(), anyBoolean());
+        mClientListener.onStopped(mClientModeManager);
+        mLooper.dispatchAll();
+        verify(mWifiInjector, times(2)).makeClientModeManager(any(), any(), any(), anyBoolean());
+        verify(mSoftApStateMachineCallback).onUserSwitchWithSoftAp(false);
+        assertInEnabledState();
+    }
+
+    @Test
+    public void testUserSwitchAirplaneModeFallsBackToFullShutdown() throws Exception {
+        enterClientModeActiveState();
+        enterStartedTetheredSoftApForUserSwitch();
+        mActiveModeWarden.handleUserSwitch(10);
+        mActiveModeWarden.handleUserUnlock(10);
+        mLooper.dispatchAll();
+        when(mSettingsStore.isAirplaneModeOn()).thenReturn(true);
+        when(mSettingsStore.isWifiToggleEnabled()).thenReturn(false);
+        mActiveModeWarden.airplaneModeToggled();
+        mLooper.dispatchAll();
+        verify(mSoftApManager).stop();
+        mClientListener.onStopped(mClientModeManager);
+        mLooper.dispatchAll();
+        mSoftApListener.onStopped(mSoftApManager);
+        mLooper.dispatchAll();
+        verify(mWifiInjector).makeClientModeManager(any(), any(), any(), anyBoolean());
+        verify(mSoftApStateMachineCallback).onUserSwitchWithSoftAp(false);
+        assertInDisabledState();
+    }
+
+    @Test
+    public void testUserStopDuringSoftApSwitchKeepsSoftApAndWaitsForNextUnlock()
+            throws Exception {
+        enterClientModeActiveState();
+        enterStartedTetheredSoftApForUserSwitch();
+        mActiveModeWarden.handleUserSwitch(10);
+        mActiveModeWarden.handleUserUnlock(10);
+        mLooper.dispatchAll();
+        mActiveModeWarden.handleUserStop(10);
+        mLooper.dispatchAll();
+        mClientListener.onStopped(mClientModeManager);
+        mLooper.dispatchAll();
+        verify(mWifiInjector).makeClientModeManager(any(), any(), any(), anyBoolean());
+        mActiveModeWarden.handleUserSwitch(0);
+        mActiveModeWarden.handleUserUnlock(0);
+        mLooper.dispatchAll();
+        verify(mWifiInjector, times(2)).makeClientModeManager(any(), any(), any(), anyBoolean());
+        verify(mSoftApManager, never()).stop();
+        assertInEnabledState();
+    }
+
+    @Test
+    public void testOverlappingSoftApUserSwitchesKeepSoftApAndWaitForLatestUnlock()
+            throws Exception {
+        enterClientModeActiveState();
+        enterStartedTetheredSoftApForUserSwitch();
+        mActiveModeWarden.handleUserSwitch(10);
+        mActiveModeWarden.handleUserUnlock(10);
+        mLooper.dispatchAll();
+        mActiveModeWarden.handleUserSwitch(20);
+        mLooper.dispatchAll();
+        mClientListener.onStopped(mClientModeManager);
+        mLooper.dispatchAll();
+        verify(mWifiInjector).makeClientModeManager(any(), any(), any(), anyBoolean());
+        mActiveModeWarden.handleUserUnlock(20);
+        mLooper.dispatchAll();
+        verify(mWifiInjector, times(2)).makeClientModeManager(any(), any(), any(), anyBoolean());
+        verify(mSoftApManager, never()).stop();
+        verify(mSoftApStateMachineCallback, times(2)).onUserSwitchWithSoftAp(true);
+        assertInEnabledState();
+    }
+
+    @Test
+    public void testQueuedSecondaryUserConfigCannotUpdateOwnersSoftAp() throws Exception {
+        enterStartedTetheredSoftApForUserSwitch();
+        SoftApConfiguration config = new SoftApConfiguration.Builder().setSsid("UpdatedAP").build();
+        mActiveModeWarden.updateSoftApConfiguration(
+                config, UserHandle.getUid(10, Process.SYSTEM_UID));
+        mLooper.dispatchAll();
+        verify(mSoftApManager, never()).updateConfiguration(any());
+        mActiveModeWarden.updateSoftApConfiguration(config, Process.SYSTEM_UID);
+        mLooper.dispatchAll();
+        verify(mSoftApManager).updateConfiguration(config);
+    }
+
+    @Test
+    public void testUserStopKeepsTetheredSoftApUntilNextUserUnlock() throws Exception {
+        enterClientModeActiveState();
+        enterStartedTetheredSoftApForUserSwitch();
+        // Logout stops the foreground user before the switch away from it reaches Wi-Fi.
+        mActiveModeWarden.handleUserStop(0);
+        mLooper.dispatchAll();
+        verify(mClientModeManager).stop();
+        mClientListener.onStopped(mClientModeManager);
+        mLooper.dispatchAll();
+        verify(mWifiInjector).makeClientModeManager(any(), any(), any(), anyBoolean());
+        mActiveModeWarden.handleUserSwitch(10);
+        mActiveModeWarden.handleUserUnlock(10);
+        mLooper.dispatchAll();
+        verify(mWifiInjector, times(2)).makeClientModeManager(any(), any(), any(), anyBoolean());
+        verify(mSoftApManager, never()).stop();
+        verify(mSoftApStateMachineCallback, times(2)).onUserSwitchWithSoftAp(true);
+        assertInEnabledState();
+    }
+
+    @Test
+    public void testUserSwitchStopsLocalOnlyHotspotWithoutTetheredSoftAp() throws Exception {
+        enterSoftApActiveMode(new SoftApModeConfiguration(WifiManager.IFACE_IP_MODE_LOCAL_ONLY,
+                null, mSoftApCapability, TEST_COUNTRYCODE, null));
+        when(mSoftApManager.isStarted()).thenReturn(true);
+        assertWifiShutDown(() -> {
+            mActiveModeWarden.handleUserSwitch(10);
+            mLooper.dispatchAll();
+        });
+    }
+
+    @Test
+    public void testUserSwitchMissingSoftApConfigurationFallsBack() throws Exception {
+        enterSoftApActiveMode();
+        when(mSoftApManager.isStarted()).thenReturn(true);
+        assertWifiShutDown(() -> {
+            mActiveModeWarden.handleUserSwitch(10);
+            mLooper.dispatchAll();
+        });
     }
 
     @Test

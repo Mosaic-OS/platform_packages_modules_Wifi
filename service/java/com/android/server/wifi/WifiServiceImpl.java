@@ -595,6 +595,8 @@ public class WifiServiceImpl extends IWifiManager.Stub {
          */
         void onStateChanged(SoftApState state) {}
 
+        void onUserSwitchWithSoftAp(boolean preserved) {}
+
         /**
          * The callback which only is used in service internally and pass to WifiManager.
          * It will base on the change to send corresponding callback as below:
@@ -1309,6 +1311,10 @@ public class WifiServiceImpl extends IWifiManager.Stub {
             return;
         }
         if (!mHasPendingSoftApUserSwitchNotification) {
+            return;
+        }
+        int state = mTetheredSoftApTracker.getState().getState();
+        if (state != WIFI_AP_STATE_DISABLED && state != WIFI_AP_STATE_FAILED) {
             return;
         }
         if (!isUserReadyForSoftApUserSwitchNotification(userId, action)) {
@@ -2960,6 +2966,18 @@ public class WifiServiceImpl extends IWifiManager.Stub {
     }
 
     private final class TetheredSoftApTracker extends BaseSoftApTracker {
+        @Override
+        void onUserSwitchWithSoftAp(boolean preserved) {
+            mHasPendingSoftApUserSwitchNotification = !preserved;
+            maybePostPendingSoftApUserSwitchNotification(mLastForegroundUserId, null);
+        }
+
+        @Override
+        public void onStateChanged(SoftApState softApState) {
+            super.onStateChanged(softApState);
+            maybePostPendingSoftApUserSwitchNotification(mLastForegroundUserId, null);
+        }
+
         public void updateSoftApCapabilityWhenCarrierConfigChanged(int subId) {
             CarrierConfigManager carrierConfigManager =
                     mContext.getSystemService(CarrierConfigManager.class);
@@ -3793,7 +3811,7 @@ public class WifiServiceImpl extends IWifiManager.Stub {
                 mWifiNative)) {
             mWifiApConfigStore.setApConfiguration(softApConfig);
             // Send the message for AP config update after the save is done.
-            mActiveModeWarden.updateSoftApConfiguration(softApConfig);
+            mActiveModeWarden.updateSoftApConfiguration(softApConfig, uid);
             return true;
         } else {
             Log.e(TAG, "Invalid SoftAp Configuration");

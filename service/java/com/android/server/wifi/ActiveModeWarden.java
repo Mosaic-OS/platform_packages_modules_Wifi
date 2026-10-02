@@ -169,6 +169,8 @@ public class ActiveModeWarden {
     private int mCurrentUserId = UserHandle.SYSTEM.getIdentifier();
     private boolean mIsHandlingUserSwitchOrStop = false;
     private boolean mIsPendingUserUnlock = false;
+    private boolean mIsSwitchingUserWithSoftAp;
+    @Nullable private SoftApManager mSoftApForUserSwitch;
     private boolean mIsMultiplePrimaryBugreportTaken = false;
     private boolean mIsShuttingdown = false;
     private boolean mVerboseLoggingEnabled = false;
@@ -991,8 +993,9 @@ public class ActiveModeWarden {
     }
 
     /** Update SoftAp Configuration. */
-    public void updateSoftApConfiguration(SoftApConfiguration config) {
-        mWifiController.sendMessage(WifiController.CMD_UPDATE_AP_CONFIG, config);
+    public void updateSoftApConfiguration(SoftApConfiguration config, int callingUid) {
+        mWifiController.sendMessage(WifiController.CMD_UPDATE_AP_CONFIG,
+                UserHandle.getUserId(callingUid), 0, config);
     }
 
     /** Emergency Callback Mode has changed. */
@@ -1407,8 +1410,14 @@ public class ActiveModeWarden {
         }
     }
 
-    private void updateConfigurationToSoftApModeManager(SoftApConfiguration config) {
+    private void updateConfigurationToSoftApModeManager(SoftApConfiguration config,
+            int callingUserId) {
         for (SoftApManager softApManager : mSoftApManagers) {
+            if (softApManager.getRole() == ROLE_SOFTAP_TETHERED
+                    && (mCurrentUserId != UserHandle.SYSTEM.getIdentifier()
+                            || callingUserId != UserHandle.SYSTEM.getIdentifier())) {
+                continue;
+            }
             softApManager.updateConfiguration(config);
         }
     }
@@ -2168,6 +2177,103 @@ public class ActiveModeWarden {
             return recoveryDelayMillis;
         }
 
+        private boolean canPreserveSoftApOnUserSwitch() {
+            SoftApManager manager = getTetheredSoftApManager();
+            return manager != null && manager.isStarted()
+                    && manager.getSoftApModeConfiguration() != null
+                    && manager.getSoftApModeConfiguration().getSoftApConfiguration() != null
+                    && !mIsHandlingUserSwitchOrStop && !mIsShuttingdown
+                    && !mSettingsStore.isAirplaneModeOn() && !mSettingsStore.isSatelliteModeOn()
+                    && !mIsEmergencyScanInProgress
+                    && !mWifiInjector.getSelfRecovery().isRecoveryInProgress()
+                    && !isSoftApRestartingForCcChange(IFACE_IP_MODE_TETHERED)
+                    && mSoftApManagers.stream().allMatch(m -> m == manager
+                            || m.getRole() == ActiveModeManager.ROLE_SOFTAP_LOCAL_ONLY);
+        }
+
+        private void abortSoftApUserSwitch() {
+            if (mSoftApForUserSwitch != null) {
+                log("Falling back to full Wi-Fi shutdown during user switch");
+                mSoftApForUserSwitch = null;
+                mSoftApCallback.onUserSwitchWithSoftAp(false);
+                shutdownWifi();
+            }
+        }
+
+        private void maybeCompleteSoftApUserSwitch() {
+            if (mSoftApForUserSwitch != null
+                    && (!mSoftApManagers.contains(mSoftApForUserSwitch)
+                            || !mSoftApForUserSwitch.isStarted() || mIsShuttingdown
+                            || mSettingsStore.isAirplaneModeOn()
+                            || mSettingsStore.isSatelliteModeOn()
+                            || mWifiInjector.getSelfRecovery().isRecoveryInProgress()
+                            || isSoftApRestartingForCcChange(IFACE_IP_MODE_TETHERED))) {
+                abortSoftApUserSwitch();
+            }
+            if (mSoftApForUserSwitch == null) {
+                if (!hasAnyModeManager()) {
+                    mWifiInjector.getSelfRecovery().onWifiStopped();
+                    transitionTo(mDisabledState);
+                }
+                return;
+            }
+            // Manager removal callbacks are the barrier before the new user's STA can start.
+            if (hasAnyClientModeManager() || mSoftApManagers.size() != 1
+                    || !hasDeferredMessages(CMD_USER_UNLOCK)) {
+                return;
+            }
+            removeDeferredMessages(CMD_USER_UNLOCK);
+            mSoftApForUserSwitch = null;
+            mIsSwitchingUserWithSoftAp = false;
+            mIsHandlingUserSwitchOrStop = false;
+            if (shouldEnableSta()) {
+                startPrimaryOrScanOnlyClientModeManager(new WorkSource(Process.WIFI_UID));
+            }
+        }
+
+        private boolean processMessageDuringSoftApUserSwitch(Message msg) {
+            switch (msg.what) {
+                case CMD_USER_UNLOCK:
+                    deferMessage(msg);
+                    maybeCompleteSoftApUserSwitch();
+                    return HANDLED;
+                case CMD_STA_STOPPED:
+                case CMD_STA_START_FAILURE:
+                case CMD_AP_STOPPED:
+                case CMD_AP_START_FAILURE:
+                    maybeCompleteSoftApUserSwitch();
+                    return HANDLED;
+                case CMD_WIFI_TOGGLED:
+                case CMD_SCAN_ALWAYS_MODE_CHANGED:
+                    // Unlock applies the latest settings after the old user's managers stop.
+                    return HANDLED;
+                case CMD_REQUEST_ADDITIONAL_CLIENT_MODE_MANAGER:
+                    ((AdditionalClientModeManagerRequestInfo) msg.obj).listener.onAnswer(null);
+                    return HANDLED;
+                case CMD_UPDATE_AP_CAPABILITY:
+                case CMD_UPDATE_AP_CONFIG:
+                case CMD_REMOVE_ADDITIONAL_CLIENT_MODE_MANAGER:
+                    return NOT_HANDLED;
+                case CMD_USER_SWITCH:
+                case CMD_USER_STOP:
+                    // Logout or a further switch keeps the hotspot; wait for the newest unlock.
+                    removeDeferredMessages(CMD_USER_UNLOCK);
+                    mSoftApCallback.onUserSwitchWithSoftAp(true);
+                    return HANDLED;
+                case CMD_EMERGENCY_CALL_STATE_CHANGED:
+                case CMD_EMERGENCY_MODE_CHANGED:
+                    abortSoftApUserSwitch();
+                    maybeCompleteSoftApUserSwitch();
+                    return NOT_HANDLED;
+                default:
+                    break;
+            }
+            abortSoftApUserSwitch();
+            deferMessage(msg);
+            maybeCompleteSoftApUserSwitch();
+            return HANDLED;
+        }
+
         abstract class BaseState extends RunnerState {
             BaseState(int threshold, @NonNull LocalLog localLog) {
                 super(threshold, localLog);
@@ -2315,6 +2421,9 @@ public class ActiveModeWarden {
 
             @Override
             public final boolean processMessageImpl(Message msg) {
+                if (mIsSwitchingUserWithSoftAp && processMessageDuringSoftApUserSwitch(msg)) {
+                    return HANDLED;
+                }
                 // potentially enter emergency mode
                 if (msg.what == CMD_EMERGENCY_CALL_STATE_CHANGED
                         || msg.what == CMD_EMERGENCY_MODE_CHANGED) {
@@ -2427,7 +2536,8 @@ public class ActiveModeWarden {
                         updateCapabilityToSoftApModeManager((SoftApCapability) msg.obj, msg.arg1);
                         break;
                     case CMD_UPDATE_AP_CONFIG:
-                        updateConfigurationToSoftApModeManager((SoftApConfiguration) msg.obj);
+                        updateConfigurationToSoftApModeManager(
+                                (SoftApConfiguration) msg.obj, msg.arg1);
                         break;
                     case CMD_SATELLITE_MODE_CHANGED:
                         if (mSettingsStore.isSatelliteModeOn()) {
@@ -2501,6 +2611,8 @@ public class ActiveModeWarden {
                     Log.e(TAG, "Entered DisabledState, but has active mode managers");
                 }
                 mIsHandlingUserSwitchOrStop = false;
+                mIsSwitchingUserWithSoftAp = false;
+                mSoftApForUserSwitch = null;
             }
 
             @Override
@@ -2966,6 +3078,15 @@ public class ActiveModeWarden {
                     }
                     case CMD_USER_STOP:
                     case CMD_USER_SWITCH:
+                        if (canPreserveSoftApOnUserSwitch()) {
+                            mIsHandlingUserSwitchOrStop = true;
+                            mIsSwitchingUserWithSoftAp = true;
+                            mSoftApForUserSwitch = getTetheredSoftApManager();
+                            mSoftApCallback.onUserSwitchWithSoftAp(true);
+                            stopAllClientModeManagers();
+                            stopSoftApModeManagers(IFACE_IP_MODE_LOCAL_ONLY);
+                            break;
+                        }
                         mIsHandlingUserSwitchOrStop = true;
                         shutdownWifi();
                         break;
